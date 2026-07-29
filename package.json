@@ -1,0 +1,25 @@
+{
+  "name": "mft-file-search",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Millisecond-level Windows NTFS file search using MFT and USN Journal, with a universal Agent Skill.",
+  "keywords": [
+    "windows-file-search",
+    "millisecond-search",
+    "file-indexing",
+    "ntfs",
+    "mft",
+    "usn-journal",
+    "native-aot",
+    "agent-skills",
+    "codex",
+    "claude-code",
+    "ai-agent",
+    "pi-package"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  }
+}

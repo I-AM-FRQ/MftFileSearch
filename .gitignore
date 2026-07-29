@@ -1,0 +1,19 @@
+# .NET build output
+bin/
+obj/
+[Bb]uild/
+
+# Native AOT publish output
+publish-*/
+
+# Local MFT indexes
+*.mftdb
+*.mftdb.tmp
+
+# IDE and OS files
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
