@@ -2,194 +2,154 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-> **A millisecond-level Windows file search tool for local NTFS volumes, with a bundled Skill for Codex, Claude Code, pi, and other Agent Skills-compatible agents.**
+> A local Windows NTFS file-search engine with a standalone Native AOT executable, a compact live-updating memory service, and bundled Agent Skills support.
 
-MftFileSearch builds a compact local index from the NTFS Master File Table (MFT), then keeps it current through the NTFS USN Journal. It provides fast exact file-name and directory-name lookup, indexed extension counts, and a portable Native AOT executable with no .NET Runtime, database engine, or additional DLL dependency.
+MftFileSearch scans NTFS Master File Table (MFT) records and searches file or directory base names. Every returned path is live-confirmed from its NTFS File Reference Number (FRN), so a deleted, renamed, or moved item is not returned as a stale path.
 
-Search results are confirmed against the current NTFS File Reference Number (FRN), so same-volume moves, renames, and deletions do not produce stale indexed paths.
+The default experience is a pure-memory background service. It builds a compact RAM index at startup and continuously applies per-volume NTFS changes while it runs.
 
-## Highlights
+## What It Does
 
-- **Fast exact indexed search** plus practical filename and directory-name substring search.
-- **Persistent pure-memory service** for pi: it keeps a compact RAM-only MFT index current with per-volume USN Journal synchronization.
-- **Cursor pagination** with `NEXT_CURSOR`, so later pages continue without rescanning earlier matches.
-- **Compact persistent `.mftdb` index** stored beside the executable by default.
-- **Incremental USN Journal updates** instead of repeatedly walking directory trees.
-- **Unicode-safe console I/O**, including Chinese and other non-ASCII paths.
-- **Native AOT, single executable**: no .NET Runtime, SQLite, or extra DLLs required.
-- **Cross-agent Skill package** following the [Agent Skills](https://agentskills.io/specification) standard for Codex, Claude Code, pi, and other compatible Agent harnesses.
+- Search local files and folders by full name or part of a name.
+- Find Chinese and English names; English searches ignore letter case.
+- Return the file or folder's current path instead of an old path left behind after a rename, move, or deletion.
+- Show only a manageable page of results and continue from where the previous page stopped.
+- Count files by extension, such as `.txt` or `.png`.
+- Keep search results up to date while the service is running: new, renamed, moved, and deleted items usually appear within a few seconds without a manual refresh.
+- Handle several searches at the same time without exposing a network port.
+- Stay around a few hundred MB of memory even when indexing millions of files.
+- Run as one Windows executable with no separate runtime or database installation.
+- Work with Codex, Claude Code, pi, and compatible AI coding agents through the bundled Skill.
 
-## Download
+## Measured Results
 
-Download the current Windows x64 package from [Releases](https://github.com/I-AM-FRQ/MftFileSearch/releases):
+The following measurements were taken on local `C:` and `D:` NTFS volumes with approximately **2.99 million indexed file records**. They are reference measurements, not latency guarantees; hardware, MFT size, cache warmth, filesystem activity, and administrator privileges affect results.
 
-- `MftFileSearch-win-x64.zip`: standalone executable package.
-- `mft-file-search-skill-win-x64.zip`: complete Agent Skill package with `SKILL.md` and the bundled executable.
+| Scenario | Result |
+| --- | --- |
+| Pure-memory service private memory after initial scan | **241.80 MB** |
+| Pure-memory service working set after initial scan | **245.55 MB** |
+| First search | **25.462 ms** server time |
+| Same search again | **0.601 ms** server time |
+| Chinese name search | **7.834 ms** server time |
+| 64 concurrent mixed exact/file/directory substring requests | **64/64 succeeded**, **0 failures**, **59.99 ms** wall-clock |
+| Same 64-request run, server median / P95 / max | **1.260 / 28.086 / 44.230 ms** |
+| Live USN create / rename / delete visibility | about **2 s / 2 s / 1 s**, no reload |
+
+The 64-request test used a warm service and mixed English, Chinese, exact, file-substring, and directory-substring searches. Repeating the same search is faster because the service remembers recent results. A first-time substring search remains complete and correct; it can be slower than a repeated search.
+
+## Requirements
+
+- Windows 10 or later.
+- Ready local NTFS volumes only. FAT, exFAT, ReFS, network shares, and cloud-only placeholders are outside the supported scope.
+- MFT enumeration, USN Journal access, and FRN path confirmation normally require an elevated Administrator process.
+- The service is local to the current Windows user. It does not expose a network port.
 
 ## Quick Start
 
-Open PowerShell or Command Prompt as Administrator and run commands from the directory containing `MftFileSearch.exe`:
-
-```powershell
-.\MftFileSearch.exe scan <drive|all>
-.\MftFileSearch.exe update <drive|all>
-.\MftFileSearch.exe search <full-file-name>
-.\MftFileSearch.exe search-part <file-name-fragment>
-```
-
-Run `scan` once to build the initial index. Afterwards, run `update` to synchronize changes before queries that must include recent file-system changes.
-
-## Index Location
-
-Without `--db`, the index is saved beside the executable:
+For pi, reload the extension and start the service:
 
 ```text
-file-index.mftdb
+/reload
+/mft-service-start
 ```
 
-To use a custom index, pass the same `--db` path to every related command:
+The service scans local NTFS volumes into memory once, then stays available for searches and automatically follows later filesystem changes.
+
+To start it from PowerShell for another integration:
 
 ```powershell
-.\MftFileSearch.exe --db <index-file> scan <drive|all>
-.\MftFileSearch.exe --db <index-file> update <drive|all>
-.\MftFileSearch.exe --db <index-file> search <full-file-name>
+.\MftFileSearch.exe serve --pipe mft-file-search-service
 ```
 
-## Commands
+## Available Searches
 
-### `scan <drive|all>`
+The service supports these operations:
 
-Fully enumerates the MFT of the selected local NTFS volume and atomically replaces that volume's index data.
-
-```powershell
-.\MftFileSearch.exe scan <drive>
-.\MftFileSearch.exe scan all
-```
-
-Use a full scan for first use, after an index-format upgrade, when the USN Journal is reset or its required history has expired, or when a volume must be rebuilt deliberately. It normally requires Administrator privileges.
-
-### `update <drive|all>`
-
-Reads USN Journal records since the saved checkpoint and applies creates, deletes, moves, renames, and related changes without re-enumerating the full MFT.
-
-```powershell
-.\MftFileSearch.exe update <drive>
-.\MftFileSearch.exe update all
-```
-
-If the command reports that a full scan is required, run `scan` for the affected volume.
-
-### `search <file-name>`
-
-Performs an exact file-name lookup. English names are case-insensitive. Each result is emitted as one current absolute path.
-
-```powershell
-.\MftFileSearch.exe search <full-file-name>
-```
-
-Provide only the base file name. Wildcards, substring search, and extension-only search are not supported by this exact command. No match produces no output and still exits with `0`.
-
-### `search-part <file-name-fragment>`
-
-Finds files whose base name contains the supplied text. English names are case-insensitive. The query checks indexed names and then confirms each returned path with NTFS.
-
-```powershell
-.\MftFileSearch.exe search-part <file-name-fragment>
-```
-
-This is a contains search, not a wildcard or regular-expression engine. Results are paginated: the default page contains 100 current paths and a page can contain up to 1,000. When more matches exist, the program writes `NEXT_OFFSET=<number>` to standard error. Use that value with the same query to request the next page:
-
-```powershell
-.\MftFileSearch.exe search-part <file-name-fragment> --limit <page-size> --offset <next-offset>
-```
-
-Use a longer fragment to reduce the number of pages.
-
-### `search-dir <directory-name>`
-
-Performs an exact final-directory-name lookup. Each result is emitted as one current absolute directory path.
-
-```powershell
-.\MftFileSearch.exe search-dir <full-directory-name>
-```
-
-Provide only the final directory name. Multiple matches are expected for common names.
-
-### `search-dir-part <directory-name-fragment>`
-
-Finds directories whose final name contains the supplied text.
-
-```powershell
-.\MftFileSearch.exe search-dir-part <directory-name-fragment>
-```
-
-Results use the same `--limit` and `--offset` pagination protocol as file-name substring search.
-
-### `count <extension>`
-
-Returns the number of unique indexed NTFS file records with the requested extension, without traversing directories.
-
-```powershell
-.\MftFileSearch.exe count <extension>
-```
-
-The extension may include or omit its leading dot. Hard links count once per NTFS file record, not once per path. Run `update` first when the count must include recent changes.
-
-### Pagination
-
-All four name-search commands support pagination:
-
-```text
-search <file-name> [--limit <page-size>] [--offset <offset>]
-search-part <file-name-fragment> [--limit <page-size>] [--offset <offset>]
-search-dir <directory-name> [--limit <page-size>] [--offset <offset>]
-search-dir-part <directory-name-fragment> [--limit <page-size>] [--offset <offset>]
-```
-
-The default page size is `100`; the allowed range is `1` to `1,000`. The standalone CLI supports stateless `NEXT_OFFSET` pagination. The named-pipe service additionally returns an opaque `nextCursor`; send it back with the same command and query to continue without rebuilding the name-match candidate list. Service cursors expire after ten minutes and are invalidated by a service reload.
-
-### `serve --pipe <pipe-name>`
-
-Starts a local named-pipe query service and directly scans all ready local NTFS MFTs into a compact in-memory index. The service does not read or write `.mftdb`. After the initial scan, it polls each volume's NTFS USN Journal once per second and applies create, delete, move, and rename changes through a small in-memory overlay. If Journal history is unavailable or its ID changes, only the affected volume is rescanned. Large overlays are likewise compacted by rescanning that one volume. This is intended for integrations such as the bundled pi extension; normal command-line use does not need it. The pipe is restricted to the current Windows user and does not open a network port. The service uses fixed-size, case-folded trigram signatures and a small LRU query cache for fast substring search without a full inverted index. It accepts read-only name queries, `count`, `volumes`, and `reload` requests over its local pipe. `reload` rescans all ready NTFS MFTs and replaces the in-memory index. It exits after a `shutdown` request.
-
-```powershell
-.\MftFileSearch.exe serve --pipe <pipe-name>
-```
-
-The pi extension can start this service lazily on its first read query or with `/mft-service-start`. It stays running across pi restarts until `/mft-service-stop` is used. The first service start and every reload pay the full MFT scan cost; later queries reuse the RAM-only index and normally observe filesystem changes within about one polling interval. The standalone CLI `scan`/`update` commands remain available for users who want the persistent `.mftdb` workflow.
-
-### `volumes`
-
-Lists indexed volumes as tab-separated volume root, indexed file-record count, and UTC index timestamp.
-
-```powershell
-.\MftFileSearch.exe volumes
-.\MftFileSearch.exe --db <index-file> volumes
-```
-
-## Help and Exit Codes
-
-```powershell
-.\MftFileSearch.exe --help
-.\MftFileSearch.exe -h
-.\MftFileSearch.exe /?
-```
-
-`--db <index-file>` must appear before the command:
-
-```powershell
-.\MftFileSearch.exe --db <index-file> update <drive|all>
-```
-
-| Code | Meaning |
+| Operation | Result |
 | --- | --- |
-| `0` | Command completed successfully. Empty `search` and `search-dir` results also use this code. |
-| `2` | Invalid command or arguments. |
-| `3` | Index, permissions, volume, NTFS, or USN Journal operation failed. |
+| `search` | Find files with an exact name. |
+| `search-part` | Find files whose name contains a word or fragment. |
+| `search-dir` | Find folders with an exact name. |
+| `search-dir-part` | Find folders whose name contains a word or fragment. |
+| `count` | Count files with an extension. |
+| `volumes` | Show the scanned volumes and record counts. |
 
-## Agent Support
+Results are returned in pages. Use the returned `nextCursor` to continue from the previous page without starting over. Empty results are still successful.
 
-The repository includes a self-contained [Agent Skills](https://agentskills.io/specification) package for **Codex**, **Claude Code**, **pi**, and other agents that load `SKILL.md`-based Skills:
+## Pure-Memory Service
+
+Start the service with a pipe name chosen by the client:
+
+```powershell
+.\MftFileSearch.exe serve --pipe mft-file-search-service
+```
+
+At startup, the service scans every ready local NTFS volume directly into compact RAM structures. It records each volume's USN Journal checkpoint before scanning, so changes occurring during the scan are collected by the next sync pass.
+
+After startup, a background worker polls each volume about once per second:
+
+1. Reads USN records after the last in-memory checkpoint.
+2. Adds created or renamed records to a small overlay.
+3. Marks deleted or superseded FRNs so obsolete baseline records are hidden.
+4. Merges the baseline and overlay for all queries.
+5. Rebuilds only one volume when its Journal history is unavailable, its Journal ID changes, or the overlay reaches its compaction threshold.
+
+All search data and update state live only in memory. Stopping the service or restarting Windows starts a fresh scan next time.
+
+### Service Protocol
+
+The service reads one JSON request per named-pipe connection and writes one JSON response line.
+
+Request:
+
+```json
+{"command":"search-part","args":["project-notes","--limit","25","--offset","0"],"cursor":null}
+```
+
+Response fields:
+
+```json
+{
+  "protocolVersion": 3,
+  "code": 0,
+  "status": "success",
+  "elapsedMs": 1.26,
+  "paths": ["C:\\Example\\file.txt"],
+  "nextOffset": 25,
+  "nextCursor": "opaque-token",
+  "output": null,
+  "error": null,
+  "shutdown": false
+}
+```
+
+Supported service commands are `search`, `search-part`, `search-dir`, `search-dir-part`, `count`, `volumes`, `reload`, and `shutdown`.
+
+- `nextCursor` is valid only in the same service process, for the same command and query.
+- Cursors expire after ten minutes, are limited to 128 active cursors, and are invalidated by `reload`.
+- A cursor continuation avoids rebuilding earlier name-match candidates.
+- `reload` explicitly rescans all ready NTFS volumes and invalidates every cursor.
+
+## pi Integration
+
+The bundled pi extension exposes model tools and slash commands for exact/substring file and directory searches, pagination, extension counts, service status, start, stop, and reload.
+
+Typical lifecycle:
+
+```text
+/reload
+/mft-service-start
+/mft-service-status
+/mft-service-reload
+/mft-service-stop
+```
+
+The service persists across pi reloads and session changes until it is stopped or Windows restarts. Normal filesystem changes do not require `/mft-service-reload`; live USN synchronization handles them.
+
+## Agent Skill
+
+The complete Skill package is included here:
 
 ```text
 skills/mft-file-search/
@@ -197,79 +157,30 @@ skills/mft-file-search/
 └── tools/MftFileSearch.exe
 ```
 
-The Skill gives an Agent a workflow for pure-memory MFT service control, exact and substring queries, paged result retrieval, extension counts, and current-path confirmation. The bundled Native AOT executable is ready to run without a separate download or a .NET installation.
+The bundled pi extension is the recommended integration. The Skill directory is included for Agent Skills-compatible hosts that need it.
 
-Copy the complete `mft-file-search` directory, including `tools\MftFileSearch.exe`; copying only `SKILL.md` is not sufficient.
+## Exit Codes
 
-### Codex
+| Code | Meaning |
+| --- | --- |
+| `0` | Successful command, including an empty exact search. |
+| `2` | Invalid command or arguments. |
+| `3` | Index, permission, volume, NTFS, or USN Journal operation failed. |
 
-Copy the directory to Codex's Skills directory. `CODEX_HOME` defaults to `~\.codex` when it is not set:
+## Build From Source
 
-```powershell
-$skillSource = "C:\path\to\mft-file-search"
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
-New-Item -ItemType Directory -Force -Path (Join-Path $codexHome "skills")
-Copy-Item $skillSource (Join-Path $codexHome "skills\mft-file-search") -Recurse
-```
-
-### Claude Code
-
-Copy the directory to the global Claude Code Skills directory:
-
-```powershell
-$skillSource = "C:\path\to\mft-file-search"
-New-Item -ItemType Directory -Force -Path (Join-Path $HOME ".claude\skills")
-Copy-Item $skillSource (Join-Path $HOME ".claude\skills\mft-file-search") -Recurse
-```
-
-### pi
-
-Load the local Skill temporarily:
-
-```powershell
-pi --skill .\skills\mft-file-search
-```
-
-The repository `package.json` also declares `pi.skills`, so it can be installed as a pi package:
-
-```powershell
-pi install git:github.com/I-AM-FRQ/MftFileSearch
-```
-
-### Other compatible Agents
-
-For a project-local shared Skill, copy the directory to `.agents\skills\mft-file-search`. Agents that support the Agent Skills layout can then discover it according to their own configuration:
-
-```powershell
-$skillSource = "C:\path\to\mft-file-search"
-New-Item -ItemType Directory -Force -Path ".\.agents\skills"
-Copy-Item $skillSource ".\.agents\skills\mft-file-search" -Recurse
-```
-
-The default index is `tools\file-index.mftdb`; use `--db` to select another location:
-
-```powershell
-& .\tools\MftFileSearch.exe --db <index-file> update <drive|all>
-```
-
-## Requirements and Limitations
-
-- Windows 10 or later.
-- Local, ready NTFS volumes only.
-- `scan`, `update`, and live path confirmation normally require Administrator privileges.
-- The current index format is `.mftdb v5`; older SQLite `.db` and `.mftdb v1/v2/v3/v4` indexes require a new `scan` before substring search is available.
-- Exact name queries and substring name queries support pagination; wildcard, regular-expression, and path-fragment search are not supported.
-
-## Build from Source
-
-The build machine needs the .NET 8 SDK and Visual Studio C++ Build Tools. In **x64 Native Tools Command Prompt for Visual Studio**, run:
+The build machine needs the .NET 8 SDK and Visual Studio C++ Build Tools. Run from an x64 Native Tools Command Prompt for Visual Studio:
 
 ```bat
 dotnet publish -c Release -r win-x64 -o .\publish-aot
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development and verification guidance.
+Run the managed build during development:
+
+```powershell
+dotnet build -c Release
+```
 
 ## License
 
-This project is released under the [MIT License](LICENSE).
+[MIT](LICENSE)

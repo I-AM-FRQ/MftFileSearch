@@ -2,194 +2,154 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-> **Windows 系统下的毫秒级本地文件搜索工具，支持 Codex、Claude Code、pi 等主流 Agent。**
+> 面向本地 Windows NTFS 卷的文件搜索引擎：单文件 Native AOT EXE、紧凑实时内存服务，以及内置 Agent Skill。
 
-MftFileSearch 面向本地 NTFS 卷，首次从 NTFS 主文件表（MFT）建立紧凑索引，之后通过 NTFS USN Journal 增量同步变更。它支持完整文件名和完整文件夹名的精确查询、扩展名统计，并提供无需 .NET Runtime、数据库引擎或额外 DLL 的 Native AOT 单文件程序。
+MftFileSearch 扫描 NTFS 主文件表（MFT），按文件或目录的基础名称进行搜索。每一条返回路径都会通过其当前 NTFS 文件引用号（FRN）实时确认，因此已删除、重命名或移动的项目不会以过期路径返回。
 
-查询结果会通过当前 NTFS 文件引用号（FRN）进行确认。因此同一卷内移动、重命名或删除文件/目录后，不会返回过期的索引路径。
+默认使用纯内存后台服务：启动时建立紧凑 RAM 索引，运行期间按卷持续应用 NTFS 文件变化。
 
-## 特性
+## 能做什么
 
-- **快速精确索引查询**：支持完整文件名/文件夹名精确搜索，也支持实用的名称片段包含搜索。
-- **持久化纯内存服务**：pi 服务维护紧凑的纯 RAM MFT 索引，并按卷通过 USN Journal 持续同步变更。
-- **服务端游标分页**：通过 `NEXT_CURSOR` 直接继续下一页，避免重复扫描前面的匹配项。
-- **紧凑持久化 `.mftdb` 索引**：默认存放在 EXE 同目录。
-- **USN Journal 增量更新**：无需反复遍历整棵目录树。
-- **Unicode 控制台输入输出**：正确处理中文及其他非 ASCII 路径。
-- **Native AOT 单文件 EXE**：不需要安装 .NET Runtime、SQLite 或其他 DLL。
-- **跨 Agent Skill 包**：符合 [Agent Skills](https://agentskills.io/specification) 标准，支持 Codex、Claude Code、pi 及其他兼容 Agent。
+- 按完整名称或名称片段搜索本地文件和文件夹。
+- 支持中文和英文名称；英文搜索不区分大小写。
+- 文件或文件夹被重命名、移动、删除后，不返回旧路径，而是返回当前真实路径。
+- 一次只返回适量结果，可从上一页结束处继续查看。
+- 统计某个扩展名的文件数量，例如 `.txt`、`.png`。
+- 服务运行时自动跟踪文件变化：新建、重命名、移动和删除通常几秒内可搜索到，无需手动刷新。
+- 能同时处理多条搜索，不对网络开放端口。
+- 即使索引数百万文件，内存通常也只占数百 MB。
+- 一个 Windows EXE 即可运行，不需要额外安装运行库或数据库。
+- 通过内置 Skill 支持 Codex、Claude Code、pi 和其他兼容 AI 编程助手。
 
-## 下载
+## 实测数据
 
-请从 [Releases](https://github.com/I-AM-FRQ/MftFileSearch/releases) 下载当前 Windows x64 版本：
+以下数据来自本地 `C:` 与 `D:` NTFS 卷，约 **299 万条索引文件记录**。它们是参考值而非性能承诺；硬件、MFT 规模、缓存热度、文件系统活动和管理员权限都会影响结果。
 
-- `MftFileSearch-win-x64.zip`：独立 EXE 程序包。
-- `mft-file-search-skill-win-x64.zip`：完整 Agent Skill 包，包含 `SKILL.md` 和内置 EXE。
+| 场景 | 结果 |
+| --- | --- |
+| 纯内存服务初始扫描后私有内存 | **241.80 MB** |
+| 纯内存服务初始扫描后工作集 | **245.55 MB** |
+| 首次搜索 | 服务端 **25.462 ms** |
+| 再次搜索同一个名称 | 服务端 **0.601 ms** |
+| 搜索中文名称 | 服务端 **7.834 ms** |
+| 64 条并发混合精确/文件片段/目录片段请求 | **64/64 成功**，**0 失败**，墙钟 **59.99 ms** |
+| 同一 64 请求测试的服务端中位数 / P95 / 最大值 | **1.260 / 28.086 / 44.230 ms** |
+| USN 实时同步的创建 / 重命名 / 删除可见时间 | 约 **2 秒 / 2 秒 / 1 秒**，无需 reload |
+
+64 请求测试在服务已经预热的状态下进行，混合英文、中文、精确文件名、文件片段和目录片段查询。再次搜索同一个名称会更快，因为服务会记住最近的结果。第一次搜索片段时仍会返回完整正确的结果，只是可能比再次搜索慢一些。
+
+## 环境要求
+
+- Windows 10 或更高版本。
+- 仅支持本地、已就绪 NTFS 卷；FAT、exFAT、ReFS、网络共享和仅云端占位文件不在支持范围内。
+- MFT 枚举、USN Journal 访问和 FRN 路径确认通常需要以管理员身份运行。
+- 服务仅限当前 Windows 用户本地访问，不暴露网络端口。
 
 ## 快速开始
 
-以管理员身份打开 PowerShell 或 CMD，进入 `MftFileSearch.exe` 所在目录：
-
-```powershell
-.\MftFileSearch.exe scan <驱动器|all>
-.\MftFileSearch.exe update <驱动器|all>
-.\MftFileSearch.exe search <完整文件名>
-.\MftFileSearch.exe search-part <文件名片段>
-```
-
-首次使用先运行 `scan` 建立索引。之后，当查询需要包含近期文件变动时，先运行 `update` 同步增量变更。
-
-## 索引文件位置
-
-未指定 `--db` 时，索引文件默认写入 EXE 同目录：
+在 pi 中重新加载扩展并启动服务：
 
 ```text
-file-index.mftdb
+/reload
+/mft-service-start
 ```
 
-如需使用自定义索引文件，所有相关命令都应传入相同的 `--db` 路径：
+服务会先把本地 NTFS 卷扫描到内存中，之后可持续接受搜索，并自动跟踪后续文件变化。
+
+如需从 PowerShell 供其他集成使用：
 
 ```powershell
-.\MftFileSearch.exe --db <索引文件> scan <驱动器|all>
-.\MftFileSearch.exe --db <索引文件> update <驱动器|all>
-.\MftFileSearch.exe --db <索引文件> search <完整文件名>
+.\MftFileSearch.exe serve --pipe mft-file-search-service
 ```
 
-## 命令参考
+## 可用搜索
 
-### `scan <驱动器|all>`
+服务支持以下操作：
 
-全量枚举指定本地 NTFS 卷的 MFT，并原子替换该卷的索引数据。
-
-```powershell
-.\MftFileSearch.exe scan <驱动器>
-.\MftFileSearch.exe scan all
-```
-
-首次使用、索引格式升级、USN Journal 被重建或历史记录不足、以及主动要求重建某卷时，应执行全量扫描。该操作通常需要管理员权限。
-
-### `update <驱动器|all>`
-
-读取上次检查点后的 USN Journal 记录，增量同步创建、删除、移动、重命名及相关变更，不会重新遍历整张 MFT。
-
-```powershell
-.\MftFileSearch.exe update <驱动器>
-.\MftFileSearch.exe update all
-```
-
-若程序提示必须全量扫描，请对受影响卷执行 `scan`。
-
-### `search <文件名>`
-
-按完整文件名精确查询；英文名称不区分大小写。每行输出一个当前真实的绝对路径。
-
-```powershell
-.\MftFileSearch.exe search <完整文件名>
-```
-
-只传入主文件名，不传完整路径。该精确查询命令不支持通配符、子串或仅扩展名查询。未命中时不输出内容，退出码仍为 `0`。
-
-### `search-part <文件名片段>`
-
-按文件名包含指定片段查询；英文名称不区分大小写。程序先匹配索引中的名称，再通过 NTFS 确认输出的当前真实路径。
-
-```powershell
-.\MftFileSearch.exe search-part <文件名片段>
-```
-
-这是包含查询，不是通配符或正则表达式查询。查询结果采用分页：默认每页输出 100 条当前路径，单页最多 1,000 条。存在后续结果时，程序会在标准错误输出 `NEXT_OFFSET=<数值>`。使用同一查询和该数值获取下一页：
-
-```powershell
-.\MftFileSearch.exe search-part <文件名片段> --limit <每页数量> --offset <下一页偏移量>
-```
-
-可使用更长的片段减少页数。
-
-### `search-dir <文件夹名>`
-
-按最后一级完整文件夹名称精确查询；每行输出一个当前真实的绝对目录路径。
-
-```powershell
-.\MftFileSearch.exe search-dir <完整文件夹名>
-```
-
-只传入最后一级目录名称，不传完整路径。常见目录名称可能匹配多条结果。
-
-### `search-dir-part <文件夹名片段>`
-
-按最后一级文件夹名称包含指定片段查询。
-
-```powershell
-.\MftFileSearch.exe search-dir-part <文件夹名片段>
-```
-
-与文件名片段查询一样，支持 `--limit` 和 `--offset` 分页协议。
-
-### `count <扩展名>`
-
-统计指定扩展名的唯一 NTFS 文件记录数，不遍历目录树。
-
-```powershell
-.\MftFileSearch.exe count <扩展名>
-```
-
-扩展名可带或不带前导点。硬链接按同一个 NTFS 文件记录只计一次，而不是每个路径计一次。若统计需要包括近期变动，请先执行 `update`。
-
-### 分页查询
-
-四种名称查询均支持分页：
-
-```text
-search <文件名> [--limit <每页数量>] [--offset <偏移量>]
-search-part <文件名片段> [--limit <每页数量>] [--offset <偏移量>]
-search-dir <文件夹名> [--limit <每页数量>] [--offset <偏移量>]
-search-dir-part <文件夹名片段> [--limit <每页数量>] [--offset <偏移量>]
-```
-
-默认每页 `100` 条，允许范围为 `1` 到 `1,000`。独立 CLI 使用无状态的 `NEXT_OFFSET` 分页。命名管道服务还会返回不透明 `nextCursor`；以相同命令和查询将其传回，即可直接继续下一页，无需重建名称匹配候选集合。服务游标 10 分钟后过期，服务重扫后也会失效。
-
-### `serve --pipe <管道名称>`
-
-启动仅限本机的命名管道查询服务，并直接扫描所有已就绪本地 NTFS 卷的 MFT，在内存中建立紧凑索引。该模式不读取或写入 `.mftdb`。初始扫描完成后，服务每秒轮询各卷的 NTFS USN Journal，并通过小型内存覆盖层应用新增、删除、移动和重命名变更。若 Journal 历史不可用或 Journal ID 改变，仅重新扫描受影响的卷；覆盖层过大时也只压实重扫该卷。它面向 pi 扩展等集成场景，普通命令行使用通常不需要手动运行。管道仅允许当前 Windows 用户连接，且不会开放网络端口。服务使用固定大小、英文大小写折叠的三元组签名及小型 LRU 查询缓存，在不建立全量倒排索引的前提下加速片段查询。服务通过本地管道接受只读名称查询、`count`、`volumes` 和 `reload` 请求；`reload` 会再次扫描全部 NTFS MFT 并替换内存索引，收到 `shutdown` 请求后退出。
-
-```powershell
-.\MftFileSearch.exe serve --pipe <管道名称>
-```
-
-pi 扩展可在首次读取查询时自动启动服务，也可使用 `/mft-service-start` 手动启动。它会跨 pi 重启持续运行，直到使用 `/mft-service-stop` 停止。服务首次启动及每次重载都需要承担完整 MFT 扫描时间，之后的查询直接读取 RAM 中的索引，文件系统变更通常会在一个轮询周期左右反映出来。希望使用持久 `.mftdb` 的用户仍可使用独立 CLI 的 `scan`/`update` 命令。
-
-### `volumes`
-
-显示已索引卷。输出字段使用制表符分隔，依次为卷根目录、索引文件记录数和 UTC 索引时间。
-
-```powershell
-.\MftFileSearch.exe volumes
-.\MftFileSearch.exe --db <索引文件> volumes
-```
-
-## 帮助与退出码
-
-```powershell
-.\MftFileSearch.exe --help
-.\MftFileSearch.exe -h
-.\MftFileSearch.exe /?
-```
-
-`--db <索引文件>` 必须位于命令之前：
-
-```powershell
-.\MftFileSearch.exe --db <索引文件> update <驱动器|all>
-```
-
-| 退出码 | 含义 |
+| 操作 | 效果 |
 | --- | --- |
-| `0` | 命令成功；`search` 和 `search-dir` 未命中也使用该退出码。 |
-| `2` | 命令或参数无效。 |
-| `3` | 索引、权限、卷、NTFS 或 USN Journal 操作失败。 |
+| `search` | 按完整名称查找文件。 |
+| `search-part` | 按名称中的关键词或片段查找文件。 |
+| `search-dir` | 按完整名称查找文件夹。 |
+| `search-dir-part` | 按名称中的关键词或片段查找文件夹。 |
+| `count` | 统计某个扩展名的文件数量。 |
+| `volumes` | 查看已扫描卷和记录数量。 |
 
-## Agent 支持
+结果按页返回。使用返回的 `nextCursor` 可从上一页结束的位置继续，无需从头搜索。没有结果也属于成功操作。
 
-仓库包含自带 EXE、符合 [Agent Skills](https://agentskills.io/specification) 标准的 Skill，支持 **Codex**、**Claude Code**、**pi** 以及其他加载 `SKILL.md` 的兼容 Agent：
+## 纯内存服务
+
+以客户端指定的管道名称启动服务：
+
+```powershell
+.\MftFileSearch.exe serve --pipe mft-file-search-service
+```
+
+启动时服务直接把所有已就绪本地 NTFS 卷扫描为紧凑内存结构。在扫描开始前，它会记录每个卷的 USN Journal 检查点，因此扫描期间发生的变化会由下一轮同步收集。
+
+初始扫描后，后台线程约每秒对每个卷执行一次：
+
+1. 读取上一次内存检查点之后的 USN 记录。
+2. 将新增或改名后的记录写入小型覆盖层。
+3. 标记删除或已被新记录替代的 FRN，隐藏旧基线记录。
+4. 每次查询自动合并基线和覆盖层。
+5. 当 Journal 历史不可用、Journal ID 改变或覆盖层达到压实阈值时，只重建对应的一个卷。
+
+所有搜索数据和更新状态都只保存在内存中。停止服务或 Windows 重启后，下次启动会重新扫描 MFT。
+
+### 服务协议
+
+服务每次命名管道连接读取一行 JSON 请求，并写回一行 JSON 响应。
+
+请求：
+
+```json
+{"command":"search-part","args":["project-notes","--limit","25","--offset","0"],"cursor":null}
+```
+
+响应字段：
+
+```json
+{
+  "protocolVersion": 3,
+  "code": 0,
+  "status": "success",
+  "elapsedMs": 1.26,
+  "paths": ["C:\\Example\\file.txt"],
+  "nextOffset": 25,
+  "nextCursor": "opaque-token",
+  "output": null,
+  "error": null,
+  "shutdown": false
+}
+```
+
+服务支持：`search`、`search-part`、`search-dir`、`search-dir-part`、`count`、`volumes`、`reload` 与 `shutdown`。
+
+- `nextCursor` 只在同一个服务进程、相同命令和查询中有效。
+- 游标 10 分钟后过期，最多同时保留 128 个；`reload` 会让所有游标失效。
+- 使用游标继续下一页不会重建前面已经计算过的名称候选。
+- `reload` 会显式重新扫描所有已就绪 NTFS 卷并使全部游标失效。
+
+## pi 集成
+
+内置 pi 扩展向模型提供文件/目录精确和片段搜索、下一页、扩展名统计、服务状态、启动、停止及重载工具，并提供对应 Slash Commands。
+
+典型生命周期：
+
+```text
+/reload
+/mft-service-start
+/mft-service-status
+/mft-service-reload
+/mft-service-stop
+```
+
+服务会跨 pi `/reload` 和会话切换保持运行，直到手动停止或 Windows 重启。正常文件系统变化不需要 `/mft-service-reload`，由 USN 实时同步处理。
+
+## Agent Skill
+
+完整 Skill 包在：
 
 ```text
 skills/mft-file-search/
@@ -197,79 +157,30 @@ skills/mft-file-search/
 └── tools/MftFileSearch.exe
 ```
 
-Skill 为 Agent 提供纯内存 MFT 服务控制、精确/片段查询、分页获取结果、扩展名统计和当前路径确认的标准工作流。内置 Native AOT EXE 可直接使用，无需单独下载或安装 .NET。
+推荐直接使用内置 pi 扩展。保留 Skill 目录是为了兼容需要 Agent Skills 的其他宿主。
 
-复制时必须保留完整的 `mft-file-search` 目录，包括 `tools\MftFileSearch.exe`；只复制 `SKILL.md` 无法运行。
+## 退出码
 
-### Codex
-
-将完整目录复制到 Codex 的 Skills 目录。未设置 `CODEX_HOME` 时，默认使用 `~\.codex`：
-
-```powershell
-$skillSource = "C:\path\to\mft-file-search"
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
-New-Item -ItemType Directory -Force -Path (Join-Path $codexHome "skills")
-Copy-Item $skillSource (Join-Path $codexHome "skills\mft-file-search") -Recurse
-```
-
-### Claude Code
-
-将完整目录复制到 Claude Code 全局 Skills 目录：
-
-```powershell
-$skillSource = "C:\path\to\mft-file-search"
-New-Item -ItemType Directory -Force -Path (Join-Path $HOME ".claude\skills")
-Copy-Item $skillSource (Join-Path $HOME ".claude\skills\mft-file-search") -Recurse
-```
-
-### pi
-
-在 pi 中可临时加载仓库内的 Skill：
-
-```powershell
-pi --skill .\skills\mft-file-search
-```
-
-根目录 `package.json` 也声明了 `pi.skills`，可作为 pi Package 安装：
-
-```powershell
-pi install git:github.com/I-AM-FRQ/MftFileSearch
-```
-
-### 其他兼容 Agent
-
-若需要项目级共享，可将目录复制到 `.agents\skills\mft-file-search`。支持 Agent Skills 目录布局的 Agent 会根据各自配置发现它：
-
-```powershell
-$skillSource = "C:\path\to\mft-file-search"
-New-Item -ItemType Directory -Force -Path ".\.agents\skills"
-Copy-Item $skillSource ".\.agents\skills\mft-file-search" -Recurse
-```
-
-默认索引写入 `tools\file-index.mftdb`；如需其他位置，请传入 `--db`：
-
-```powershell
-& .\tools\MftFileSearch.exe --db <索引文件> update <驱动器|all>
-```
-
-## 要求与限制
-
-- Windows 10 或更高版本。
-- 仅支持本地、已就绪的 NTFS 卷。
-- `scan`、`update` 和真实路径确认通常需要管理员权限。
-- 当前索引格式为 `.mftdb v5`；旧 SQLite `.db` 及 `.mftdb v1/v2/v3/v4` 索引需要重新执行 `scan` 后才能使用名称片段搜索。
-- 完整名称与名称片段查询均支持分页；不支持通配符、正则表达式或路径片段查询。
+| 代码 | 含义 |
+| --- | --- |
+| `0` | 命令成功，包括精确搜索无结果。 |
+| `2` | 命令或参数无效。 |
+| `3` | 索引、权限、卷、NTFS 或 USN Journal 操作失败。 |
 
 ## 从源码构建
 
-构建机需要 .NET 8 SDK 和 Visual Studio C++ Build Tools。在 **x64 Native Tools Command Prompt for Visual Studio** 中执行：
+构建机需要 .NET 8 SDK 和 Visual Studio C++ Build Tools。在 Visual Studio 的 x64 Native Tools Command Prompt 中执行：
 
 ```bat
 dotnet publish -c Release -r win-x64 -o .\publish-aot
 ```
 
-开发和验证说明请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
+开发时运行托管构建：
+
+```powershell
+dotnet build -c Release
+```
 
 ## 许可证
 
-本项目采用 [MIT License](LICENSE)。
+[MIT](LICENSE)
