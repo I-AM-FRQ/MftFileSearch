@@ -17,60 +17,56 @@ Chinese version: [SKILL.md](SKILL.md).
 
 - Use this Skill's search tools when the user asks to locate a local file or directory.
 - Use exact search when the complete name is known; otherwise use fragment search.
-- Return a small first page. Continue only when the user needs more results.
+- Return a small first page. Continue only when the user needs more results, or when the current page has no usable paths but another page remains.
 - English names are case-insensitive; Chinese names can be searched directly.
 - Results are current paths. Moved, renamed, and deleted items should not be returned at their old paths.
 - Normal filesystem changes synchronize automatically. Do not reload for ordinary changes.
 - Reload only when the user explicitly requests a full refresh, the service is unhealthy, or the service reports that it is needed.
 
-## Service Controls
+## Service Usage
 
-In pi, use:
+The host should start the local service and send requests through a Windows named pipe:
 
-```text
-/mft-service-start
-/mft-service-status
-/mft-service-reload
-/mft-service-stop
+```powershell
+& .\tools\MftFileSearch.exe serve --pipe <pipe-name>
 ```
 
-- `/mft-service-start`: starts the service and waits for the initial scan.
-- `/mft-service-status`: checks whether it is running.
-- `/mft-service-reload`: manually rescans all ready NTFS volumes; use only for an explicitly requested full refresh.
-- `/mft-service-stop`: stops the service and frees its memory.
+The initial scan takes time; later searches use the in-memory results. The host can expose its own start, stop, status, and full-reload controls.
 
-The initial scan takes time; later searches use the in-memory results.
+- Start: scan ready NTFS volumes into memory.
+- Status: confirm whether the service is running.
+- Full reload: rescan all ready NTFS volumes; use only for an explicitly requested complete refresh.
+- Stop: end the service and free its memory.
 
 ## File Searches
 
 ### Complete file name
 
-Use `mft_search_file`, for example with the complete name `example-document.txt`.
+Send a `search` request, for example with the complete name `example-document.txt`.
 
-- `fileName`: complete base name including the extension.
-- `limit`: optional; model tools default to 25 results and allow at most 50.
+- The query is a complete base file name including its extension.
+- Use `--limit` to control page size.
 
 ### Part of a file name
 
-Use `mft_search_file_part`.
+Send a `search-part` request.
 
-- `query`: a word or fragment from the file name.
-- `limit`: optional; default 25, maximum 50.
+- The query is a word or fragment from the file name.
 - Longer fragments usually produce fewer and faster matches.
 
 ## Directory Searches
 
 ### Complete directory name
 
-Use `mft_search_directory`.
+Send a `search-dir` request.
 
-- `directoryName`: final directory name only, not a complete path.
+- The query is the final directory name only, not a complete path.
 
 ### Part of a directory name
 
-Use `mft_search_directory_part`.
+Send a `search-dir-part` request.
 
-- `query`: a word or fragment from the directory name.
+- The query is a word or fragment from the directory name.
 
 ## Pagination
 
@@ -81,19 +77,18 @@ NEXT_OFFSET=<number>
 NEXT_CURSOR=<token>
 ```
 
-To get another page, call `mft_search_next_page`:
+To get another page, repeat the request with the same query type, query text, and page size:
 
-- use the same query and query type as the preceding page;
-- pass `nextOffset`;
+- pass the preceding page's `nextOffset`;
 - also pass `cursor` when `NEXT_CURSOR` is present;
 - never invent or modify a cursor.
 
-Cursors expire after about ten minutes and are invalidated by a service reload. Start again from the first page in either case.
+Cursors expire after about ten minutes and are invalidated by a full service reload. Start again from the first page in either case.
 
 ## Extension Counts and Status
 
-- Use `mft_count_extension` to count an extension such as `.txt` or `png`.
-- Use `mft_index_status` to inspect scanned volumes, record counts, and scan time.
+- Send a `count` request to count an extension such as `.txt` or `png`.
+- Send a `volumes` request to inspect scanned volumes, record counts, and scan time.
 
 An extension count indicates quantity only. It does not identify file locations.
 
