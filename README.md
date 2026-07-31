@@ -10,8 +10,9 @@ Search results are confirmed against the current NTFS File Reference Number (FRN
 
 ## Highlights
 
-- **Millisecond-level exact indexed search** plus practical filename and directory-name substring search.
-- **Stateless pagination** with `NEXT_OFFSET`, so Agents request only the result pages they need.
+- **Fast exact indexed search** plus practical filename and directory-name substring search.
+- **Persistent pure-memory service** for pi: it keeps a compact RAM-only MFT index current with per-volume USN Journal synchronization.
+- **Cursor pagination** with `NEXT_CURSOR`, so later pages continue without rescanning earlier matches.
 - **Compact persistent `.mftdb` index** stored beside the executable by default.
 - **Incremental USN Journal updates** instead of repeatedly walking directory trees.
 - **Unicode-safe console I/O**, including Chinese and other non-ASCII paths.
@@ -145,7 +146,17 @@ search-dir <directory-name> [--limit <page-size>] [--offset <offset>]
 search-dir-part <directory-name-fragment> [--limit <page-size>] [--offset <offset>]
 ```
 
-The default page size is `100`; the allowed range is `1` to `1,000`. Reuse the same command, query, and page size with the preceding page's `NEXT_OFFSET` value. Pagination is based on the current index, so run `update` before starting a multi-page query when the file system must be current.
+The default page size is `100`; the allowed range is `1` to `1,000`. The standalone CLI supports stateless `NEXT_OFFSET` pagination. The named-pipe service additionally returns an opaque `nextCursor`; send it back with the same command and query to continue without rebuilding the name-match candidate list. Service cursors expire after ten minutes and are invalidated by a service reload.
+
+### `serve --pipe <pipe-name>`
+
+Starts a local named-pipe query service and directly scans all ready local NTFS MFTs into a compact in-memory index. The service does not read or write `.mftdb`. After the initial scan, it polls each volume's NTFS USN Journal once per second and applies create, delete, move, and rename changes through a small in-memory overlay. If Journal history is unavailable or its ID changes, only the affected volume is rescanned. Large overlays are likewise compacted by rescanning that one volume. This is intended for integrations such as the bundled pi extension; normal command-line use does not need it. The pipe is restricted to the current Windows user and does not open a network port. The service uses fixed-size, case-folded trigram signatures and a small LRU query cache for fast substring search without a full inverted index. It accepts read-only name queries, `count`, `volumes`, and `reload` requests over its local pipe. `reload` rescans all ready NTFS MFTs and replaces the in-memory index. It exits after a `shutdown` request.
+
+```powershell
+.\MftFileSearch.exe serve --pipe <pipe-name>
+```
+
+The pi extension can start this service lazily on its first read query or with `/mft-service-start`. It stays running across pi restarts until `/mft-service-stop` is used. The first service start and every reload pay the full MFT scan cost; later queries reuse the RAM-only index and normally observe filesystem changes within about one polling interval. The standalone CLI `scan`/`update` commands remain available for users who want the persistent `.mftdb` workflow.
 
 ### `volumes`
 
@@ -186,7 +197,7 @@ skills/mft-file-search/
 └── tools/MftFileSearch.exe
 ```
 
-The Skill gives an Agent a workflow for index creation, incremental synchronization, exact and substring queries, paged result retrieval, extension counts, and USN Journal recovery. The bundled Native AOT executable is ready to run without a separate download or a .NET installation.
+The Skill gives an Agent a workflow for pure-memory MFT service control, exact and substring queries, paged result retrieval, extension counts, and current-path confirmation. The bundled Native AOT executable is ready to run without a separate download or a .NET installation.
 
 Copy the complete `mft-file-search` directory, including `tools\MftFileSearch.exe`; copying only `SKILL.md` is not sufficient.
 

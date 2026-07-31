@@ -9,8 +9,15 @@ internal sealed class FileIndexDatabase
     private const int FormatVersion = 5;
     private const uint UsnReasonFileDelete = 0x00000200;
     private const uint UsnReasonRenameOldName = 0x00001000;
+    private const int MaxCachedTrigramPostings = 128;
+    private const int MaxCachedTrigramPostingEntries = 100_000;
+    private const int CompactOverlayRescanThreshold = 100_000;
     private readonly string _databasePath;
+    private readonly object _trigramCacheLock = new();
+    private readonly Dictionary<TrigramCacheKey, LinkedListNode<TrigramPostingEntry>> _trigramPostings = [];
+    private readonly LinkedList<TrigramPostingEntry> _trigramLru = [];
     private Dictionary<string, VolumeIndex> _volumes = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, CompactVolumeIndex>? _compactVolumes;
 
     internal FileIndexDatabase(string databasePath)
     {
@@ -88,7 +95,13 @@ internal sealed class FileIndexDatabase
                     }
                 }
 
-                volumes.Add(root, new VolumeIndex(root, scannedUtc, journalId, nextUsn, fileCount, directories, extensions, files));
+                volumes.Add(root, CreateVolumeIndex(
+                    root,
+                    scannedUtc,
+                    new UsnJournalState(journalId, 0, nextUsn, 0),
+                    directories,
+                    extensions,
+                    files));
             }
 
             if (stream.Position != stream.Length)
@@ -104,50 +117,187 @@ internal sealed class FileIndexDatabase
         }
     }
 
+    /// <summary>直接扫描所有已就绪 NTFS 卷，仅构建进程内索引，不读写 .mftdb。</summary>
+    internal IReadOnlyList<VolumeIndexInfo> RebuildAllVolumesInMemory(Action<string, int>? progress = null)
+    {
+        var volumes = new Dictionary<string, VolumeIndex>(StringComparer.OrdinalIgnoreCase);
+        foreach (DriveInfo drive in DriveInfo.GetDrives().Where(drive =>
+                     drive.IsReady && string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase)))
+        {
+            string root = NormalizeDrive(drive.Name);
+            volumes[root] = ScanVolumeIntoMemory(root, count => progress?.Invoke(root, count));
+        }
+
+        if (volumes.Count == 0)
+        {
+            throw new InvalidOperationException("没有找到可扫描的 NTFS 驱动器。");
+        }
+
+        _volumes = volumes;
+        _compactVolumes = null;
+        ClearTrigramCache();
+        return GetVolumes();
+    }
+
+    /// <summary>为后台服务直接扫描所有 NTFS 卷，并构建低对象数的紧凑内存索引。</summary>
+    internal IReadOnlyList<VolumeIndexInfo> RebuildAllVolumesCompactInMemory(Action<string, int>? progress = null)
+    {
+        var compactVolumes = new Dictionary<string, CompactVolumeIndex>(StringComparer.OrdinalIgnoreCase);
+        foreach (DriveInfo drive in DriveInfo.GetDrives().Where(drive =>
+                     drive.IsReady && string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase)))
+        {
+            string root = NormalizeDrive(drive.Name);
+            compactVolumes[root] = ScanVolumeIntoCompactMemory(root, count => progress?.Invoke(root, count));
+        }
+
+        if (compactVolumes.Count == 0)
+        {
+            throw new InvalidOperationException("没有找到可扫描的 NTFS 驱动器。");
+        }
+
+        _compactVolumes = compactVolumes;
+        _volumes = new Dictionary<string, VolumeIndex>(StringComparer.OrdinalIgnoreCase);
+        ClearTrigramCache();
+        CompactAfterRebuild();
+        return GetVolumes();
+    }
+
+    private static void CompactAfterRebuild()
+    {
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+    }
+
+    private static CompactVolumeIndex ScanVolumeIntoCompactMemory(string root, Action<int>? progress = null)
+    {
+        using var journalReader = new UsnJournalReader(root);
+        UsnJournalState checkpoint = journalReader.GetState();
+        CompactVolumeIndex.Builder builder = CompactVolumeIndex.CreateBuilder(root);
+        using var scanner = new MftScanner();
+        foreach (MftNodeRecord node in scanner.EnumerateNodes(root))
+        {
+            builder.Append(CalculateFileNameHash(node.FileName), node.Frn, node.ParentFrn, node.IsFile, node.FileName);
+            if (builder.RecordCount % 10_000 == 0)
+            {
+                progress?.Invoke(builder.RecordCount);
+            }
+        }
+
+        return builder.Build(checkpoint);
+    }
+
+    /// <summary>应用各卷的 USN Journal 增量；Journal 断档时仅重扫受影响的卷。</summary>
+    internal CompactSyncResult SyncCompactMemoryIndex()
+    {
+        if (_compactVolumes is null)
+        {
+            return CompactSyncResult.Empty;
+        }
+
+        int updatedVolumes = 0;
+        int rescannedVolumes = 0;
+        int changeRecords = 0;
+        var replacements = new Dictionary<string, CompactVolumeIndex>(StringComparer.OrdinalIgnoreCase);
+        foreach ((string root, CompactVolumeIndex volume) in _compactVolumes)
+        {
+            using var reader = new UsnJournalReader(root);
+            UsnJournalState currentState = reader.GetState();
+            if (currentState.JournalId != volume.Journal.JournalId)
+            {
+                replacements[root] = ScanVolumeIntoCompactMemory(root);
+                rescannedVolumes++;
+                continue;
+            }
+
+            var changes = new List<UsnChangeRecord>();
+            UsnJournalReadResult result = reader.ReadChanges(volume.Journal.NextUsn, changes.Add);
+            if (result.RequiresFullScan)
+            {
+                replacements[root] = ScanVolumeIntoCompactMemory(root);
+                rescannedVolumes++;
+                continue;
+            }
+
+            if (changes.Count == 0)
+            {
+                continue;
+            }
+
+            CompactUpdateResult update = volume.ApplyUsnChanges(changes, result.Journal);
+            changeRecords += changes.Count;
+            updatedVolumes++;
+            if (update.OverlayEntries >= CompactOverlayRescanThreshold)
+            {
+                replacements[root] = ScanVolumeIntoCompactMemory(root);
+                rescannedVolumes++;
+            }
+        }
+
+        if (replacements.Count > 0)
+        {
+            var updated = new Dictionary<string, CompactVolumeIndex>(_compactVolumes, StringComparer.OrdinalIgnoreCase);
+            foreach ((string root, CompactVolumeIndex replacement) in replacements)
+            {
+                updated[root] = replacement;
+            }
+
+            _compactVolumes = updated;
+            ClearTrigramCache();
+            CompactAfterRebuild();
+        }
+
+        return new CompactSyncResult(updatedVolumes, rescannedVolumes, changeRecords);
+    }
+
     /// <summary>全量扫描并替换一个卷的索引。</summary>
     internal int RebuildVolumeIndex(string driveName, Action<int>? progress = null)
     {
         string root = NormalizeDrive(driveName);
+        VolumeIndex rebuilt = ScanVolumeIntoMemory(root, progress, includeJournalCheckpoint: true);
+        SaveWithReplacement(root, rebuilt);
+        return rebuilt.FileCount;
+    }
+
+    private static VolumeIndex ScanVolumeIntoMemory(string root, Action<int>? progress = null, bool includeJournalCheckpoint = false)
+    {
         var directories = new Dictionary<long, DirectoryRecord>();
         var filesByKey = new Dictionary<FileRecordKey, FileRecord>();
         var extensionIds = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase) { [string.Empty] = 0 };
         var extensions = new List<string> { string.Empty };
-        UsnJournalState journal;
+        UsnJournalState journal = new(0, 0, 0, 0);
 
-        // 在扫描前设置检查点；扫描期间发生的变更会由首次 update 补上。
-        using (var reader = new UsnJournalReader(root))
+        // 仅磁盘持久索引需要 Journal 检查点；纯内存服务不读取或写入任何索引文件。
+        if (includeJournalCheckpoint)
         {
+            using var reader = new UsnJournalReader(root);
             journal = reader.GetState();
         }
 
-        using (var scanner = new MftScanner())
+        using var scanner = new MftScanner();
+        foreach (MftNodeRecord node in scanner.EnumerateNodes(root))
         {
-            foreach (MftNodeRecord node in scanner.EnumerateNodes(root))
+            if (node.IsFile)
             {
-                if (node.IsFile)
+                FileRecord file = new(
+                    CalculateFileNameHash(node.FileName),
+                    node.Frn,
+                    node.ParentFrn,
+                    GetOrAddExtensionId(node.FileName, extensionIds, extensions),
+                    node.FileName);
+                filesByKey[GetFileKey(file)] = file;
+                if (filesByKey.Count % 10_000 == 0)
                 {
-                    FileRecord file = new(
-                        CalculateFileNameHash(node.FileName),
-                        node.Frn,
-                        node.ParentFrn,
-                        GetOrAddExtensionId(node.FileName, extensionIds, extensions),
-                        node.FileName);
-                    filesByKey[GetFileKey(file)] = file;
-                    if (filesByKey.Count % 10_000 == 0)
-                    {
-                        progress?.Invoke(filesByKey.Count);
-                    }
+                    progress?.Invoke(filesByKey.Count);
                 }
-                else
-                {
-                    directories[node.Frn] = new DirectoryRecord(node.ParentFrn, node.FileName);
-                }
+            }
+            else
+            {
+                directories[node.Frn] = new DirectoryRecord(node.ParentFrn, node.FileName);
             }
         }
 
-        VolumeIndex rebuilt = CreateVolumeIndex(root, DateTime.UtcNow, journal, directories, extensions, filesByKey.Values);
-        SaveWithReplacement(root, rebuilt);
-        return rebuilt.FileCount;
+        return CreateVolumeIndex(root, DateTime.UtcNow, journal, directories, extensions, filesByKey.Values);
     }
 
     /// <summary>仅应用上次检查点之后的 NTFS USN Journal 记录。</summary>
@@ -223,17 +373,68 @@ internal sealed class FileIndexDatabase
 
     internal SearchPage SearchFileNameContains(string query, int limit, int offset) =>
         SearchNamePage(
-            volume => volume.Files.Select(file => new NameRecord(file.Frn, file.Name)),
+            volume => GetNameContainsCandidates(volume.Root, volume.Files, query, isDirectory: false).Select(file => new NameRecord(file.Frn, file.Name)),
             name => name.Contains(query, StringComparison.OrdinalIgnoreCase),
             limit,
             offset);
 
     internal SearchPage SearchDirectoryNameContains(string query, int limit, int offset) =>
         SearchNamePage(
-            volume => volume.Directories.Select(pair => new NameRecord(pair.Key, pair.Value.Name)),
+            volume => GetNameContainsCandidates(volume.Root, volume.DirectoryEntries, query, isDirectory: true).Select(directory => new NameRecord(directory.Frn, directory.Name)),
             name => name.Contains(query, StringComparison.OrdinalIgnoreCase),
             limit,
             offset);
+
+    /// <summary>返回服务端游标使用的稳定候选记录；只返回名称匹配，路径在实际页输出时再由 FRN 确认。</summary>
+    internal IReadOnlyList<SearchCandidate> GetSearchCandidates(string command, string query)
+    {
+        if (_compactVolumes is not null)
+        {
+            return GetCompactSearchCandidates(command, query);
+        }
+
+        var candidates = new List<SearchCandidate>();
+        foreach (VolumeIndex volume in _volumes.Values.OrderBy(volume => volume.Root, StringComparer.OrdinalIgnoreCase))
+        {
+            IEnumerable<NameRecord> matches = command switch
+            {
+                "search" => GetFilesByHash(volume, CalculateFileNameHash(query))
+                    .Where(file => string.Equals(file.Name, query, StringComparison.OrdinalIgnoreCase))
+                    .Select(file => new NameRecord(file.Frn, file.Name)),
+                "search-part" => GetNameContainsCandidates(volume.Root, volume.Files, query, isDirectory: false)
+                    .Where(file => file.Name.Contains(query, StringComparison.OrdinalIgnoreCase))
+                    .Select(file => new NameRecord(file.Frn, file.Name)),
+                "search-dir" => volume.DirectoryEntries
+                    .Where(directory => string.Equals(directory.Name, query, StringComparison.OrdinalIgnoreCase))
+                    .Select(directory => new NameRecord(directory.Frn, directory.Name)),
+                "search-dir-part" => GetNameContainsCandidates(volume.Root, volume.DirectoryEntries, query, isDirectory: true)
+                    .Where(directory => directory.Name.Contains(query, StringComparison.OrdinalIgnoreCase))
+                    .Select(directory => new NameRecord(directory.Frn, directory.Name)),
+                _ => throw new ArgumentException($"不支持的搜索命令“{command}”。", nameof(command))
+            };
+
+            candidates.AddRange(matches.Select(match => new SearchCandidate(volume.Root, match.Frn, match.Name)));
+        }
+
+        return candidates;
+    }
+
+    private IReadOnlyList<SearchCandidate> GetCompactSearchCandidates(string command, string query)
+    {
+        bool isFile = command is "search" or "search-part";
+        bool isExact = command is "search" or "search-dir";
+        ulong hash = isExact ? CalculateFileNameHash(query) : 0;
+        var candidates = new List<SearchCandidate>();
+        foreach (CompactVolumeIndex volume in _compactVolumes!.Values.OrderBy(volume => volume.Root, StringComparer.OrdinalIgnoreCase))
+        {
+            IEnumerable<CompactSearchHit> matches = isExact
+                ? volume.FindExact(query, isFile, hash)
+                : volume.FindContains(query, isFile);
+            candidates.AddRange(matches.Select(match => new SearchCandidate(volume.Root, match.Frn, match.Name)));
+        }
+
+        return candidates;
+    }
 
     private SearchPage SearchNamePage(
         Func<VolumeIndex, IEnumerable<NameRecord>> candidatesForVolume,
@@ -278,6 +479,89 @@ internal sealed class FileIndexDatabase
         return new SearchPage(paths.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray(), null);
     }
 
+    private IEnumerable<TNameRecord> GetNameContainsCandidates<TNameRecord>(
+        string root,
+        TNameRecord[] records,
+        string query,
+        bool isDirectory)
+        where TNameRecord : INameRecord
+    {
+        string normalizedQuery = query.ToUpperInvariant();
+        if (normalizedQuery.Length < 3)
+        {
+            return records;
+        }
+
+        ulong trigramKey = GetTrigramKeys(normalizedQuery).First();
+        string trigram = normalizedQuery[..3];
+        int[] posting = GetOrBuildTrigramPosting(root, isDirectory, trigramKey, trigram, records);
+        return posting.Select(recordIndex => records[recordIndex]);
+    }
+
+    private int[] GetOrBuildTrigramPosting<TNameRecord>(
+        string root,
+        bool isDirectory,
+        ulong trigramKey,
+        string trigram,
+        TNameRecord[] records)
+        where TNameRecord : INameRecord
+    {
+        var cacheKey = new TrigramCacheKey(root, isDirectory, trigramKey);
+        lock (_trigramCacheLock)
+        {
+            if (_trigramPostings.TryGetValue(cacheKey, out LinkedListNode<TrigramPostingEntry>? cached))
+            {
+                _trigramLru.Remove(cached);
+                _trigramLru.AddFirst(cached);
+                return cached.Value.RecordIndexes;
+            }
+        }
+
+        int[] posting = records
+            .Select((record, index) => (record, index))
+            .Where(item => item.record.Name.Contains(trigram, StringComparison.OrdinalIgnoreCase))
+            .Select(item => item.index)
+            .ToArray();
+        if (posting.Length > MaxCachedTrigramPostingEntries)
+        {
+            return posting;
+        }
+
+        lock (_trigramCacheLock)
+        {
+            if (_trigramPostings.TryGetValue(cacheKey, out LinkedListNode<TrigramPostingEntry>? concurrent))
+            {
+                return concurrent.Value.RecordIndexes;
+            }
+
+            while (_trigramPostings.Count >= MaxCachedTrigramPostings)
+            {
+                LinkedListNode<TrigramPostingEntry>? oldest = _trigramLru.Last;
+                if (oldest is null)
+                {
+                    break;
+                }
+
+                _trigramPostings.Remove(oldest.Value.Key);
+                _trigramLru.RemoveLast();
+            }
+
+            var entry = new TrigramPostingEntry(cacheKey, posting);
+            LinkedListNode<TrigramPostingEntry> node = _trigramLru.AddFirst(entry);
+            _trigramPostings.Add(cacheKey, node);
+            return posting;
+        }
+    }
+
+    private void ClearTrigramCache()
+    {
+        lock (_trigramCacheLock)
+        {
+            _trigramPostings.Clear();
+            _trigramLru.Clear();
+        }
+    }
+
     private static IEnumerable<FileRecord> GetFilesByHash(VolumeIndex volume, ulong hash)
     {
         int index = LowerBound(volume.Files, hash);
@@ -287,9 +571,54 @@ internal sealed class FileIndexDatabase
         }
     }
 
+    /// <summary>从服务端游标候选位置继续解析当前路径；每次只确认当前页所需的 FRN。</summary>
+    internal SearchCandidatePage ResolveSearchCandidates(
+        IReadOnlyList<SearchCandidate> candidates,
+        int startIndex,
+        int limit,
+        ISet<string> seenPaths)
+    {
+        var paths = new List<string>(limit);
+        var resolvers = new Dictionary<string, NtfsFileIdPathResolver>(StringComparer.OrdinalIgnoreCase);
+        int index = startIndex;
+        try
+        {
+            while (index < candidates.Count && paths.Count < limit)
+            {
+                SearchCandidate candidate = candidates[index++];
+                if (!resolvers.TryGetValue(candidate.Root, out NtfsFileIdPathResolver? resolver))
+                {
+                    resolver = new NtfsFileIdPathResolver(candidate.Root);
+                    resolvers.Add(candidate.Root, resolver);
+                }
+
+                string? currentPath = resolver.TryGetCurrentPath(candidate.Frn);
+                if (currentPath is not null &&
+                    string.Equals(Path.GetFileName(currentPath), candidate.Name, StringComparison.OrdinalIgnoreCase) &&
+                    seenPaths.Add(currentPath))
+                {
+                    paths.Add(currentPath);
+                }
+            }
+        }
+        finally
+        {
+            foreach (NtfsFileIdPathResolver resolver in resolvers.Values)
+            {
+                resolver.Dispose();
+            }
+        }
+
+        return new SearchCandidatePage(paths, index < candidates.Count ? index : null);
+    }
+
     internal int CountByExtension(string extension)
     {
         string normalizedExtension = NormalizeExtension(extension);
+        if (_compactVolumes is not null)
+        {
+            return _compactVolumes.Values.Sum(volume => volume.CountByExtension(normalizedExtension));
+        }
         int total = 0;
         foreach (VolumeIndex volume in _volumes.Values)
         {
@@ -304,10 +633,21 @@ internal sealed class FileIndexDatabase
         return total;
     }
 
-    internal IReadOnlyList<VolumeIndexInfo> GetVolumes() => _volumes.Values
-        .OrderBy(volume => volume.Root, StringComparer.OrdinalIgnoreCase)
-        .Select(volume => new VolumeIndexInfo(volume.Root, volume.ScannedUtc, volume.FileCount, volume.NextUsn))
-        .ToArray();
+    internal IReadOnlyList<VolumeIndexInfo> GetVolumes()
+    {
+        if (_compactVolumes is not null)
+        {
+            return _compactVolumes.Values
+                .OrderBy(volume => volume.Root, StringComparer.OrdinalIgnoreCase)
+                .Select(volume => new VolumeIndexInfo(volume.Root, volume.ScannedUtc, volume.FileCount, 0))
+                .ToArray();
+        }
+
+        return _volumes.Values
+            .OrderBy(volume => volume.Root, StringComparer.OrdinalIgnoreCase)
+            .Select(volume => new VolumeIndexInfo(volume.Root, volume.ScannedUtc, volume.FileCount, volume.NextUsn))
+            .ToArray();
+    }
 
     private static void ApplyChange(
         UsnChangeRecord change,
@@ -402,6 +742,10 @@ internal sealed class FileIndexDatabase
             return comparison != 0 ? comparison : left.Frn.CompareTo(right.Frn);
         });
 
+        DirectorySearchRecord[] orderedDirectories = directories
+            .OrderBy(pair => pair.Key)
+            .Select(pair => new DirectorySearchRecord(pair.Key, pair.Value.Name))
+            .ToArray();
         return new VolumeIndex(
             root,
             scannedUtc,
@@ -410,7 +754,8 @@ internal sealed class FileIndexDatabase
             orderedFiles.Length,
             directories,
             extensions.ToArray(),
-            orderedFiles);
+            orderedFiles,
+            orderedDirectories);
     }
 
     private void SaveWithReplacement(string root, VolumeIndex replacement)
@@ -513,6 +858,16 @@ internal sealed class FileIndexDatabase
         }
 
         return volume.Root + Path.DirectorySeparatorChar + string.Join(Path.DirectorySeparatorChar, parts);
+    }
+
+    private static IEnumerable<ulong> GetTrigramKeys(string normalizedName)
+    {
+        for (int index = 0; index <= normalizedName.Length - 3; index++)
+        {
+            yield return ((ulong)normalizedName[index] << 32) |
+                         ((ulong)normalizedName[index + 1] << 16) |
+                         normalizedName[index + 2];
+        }
     }
 
     private static int LowerBound(FileRecord[] files, ulong hash)
@@ -630,16 +985,32 @@ internal sealed class FileIndexDatabase
         int FileCount,
         Dictionary<long, DirectoryRecord> Directories,
         string[] Extensions,
-        FileRecord[] Files);
+        FileRecord[] Files,
+        DirectorySearchRecord[] DirectoryEntries);
 
     private sealed record DirectoryRecord(long ParentFrn, string Name);
+    private interface INameRecord
+    {
+        string Name { get; }
+    }
+
     private readonly record struct NameRecord(long Frn, string Name);
-    private readonly record struct FileRecord(ulong NameHash, long Frn, long ParentFrn, ushort ExtensionId, string Name);
+    private readonly record struct DirectorySearchRecord(long Frn, string Name) : INameRecord;
+    private readonly record struct FileRecord(ulong NameHash, long Frn, long ParentFrn, ushort ExtensionId, string Name) : INameRecord;
     private readonly record struct FileRecordKey(ulong NameHash, long Frn, long ParentFrn);
+    private readonly record struct TrigramCacheKey(string Root, bool IsDirectory, ulong Trigram);
+    private sealed record TrigramPostingEntry(TrigramCacheKey Key, int[] RecordIndexes);
 }
 
 internal sealed record VolumeIndexInfo(string Root, DateTime ScannedUtc, int FileCount, long NextUsn);
 internal sealed record SearchPage(IReadOnlyList<string> Paths, int? NextOffset);
+internal sealed record SearchCandidate(string Root, long Frn, string Name);
+internal sealed record SearchCandidatePage(IReadOnlyList<string> Paths, int? NextIndex);
+internal sealed record CompactSyncResult(int UpdatedVolumes, int RescannedVolumes, int ChangeRecords)
+{
+    internal static CompactSyncResult Empty { get; } = new(0, 0, 0);
+}
+internal sealed record CompactUpdateResult(int OverlayEntries);
 internal sealed record IncrementalUpdateResult(bool RequiresFullScan, string? Message, int ProcessedRecords, int FileCount)
 {
     internal static IncrementalUpdateResult FullScanRequired(string message) => new(true, message, 0, 0);

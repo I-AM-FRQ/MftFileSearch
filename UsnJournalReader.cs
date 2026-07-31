@@ -215,24 +215,10 @@ internal sealed class UsnJournalReader : IDisposable
                     throw new InvalidDataException("USN Journal 记录长度无效。");
                 }
 
-                if (record.MajorVersion == 2 &&
-                    record.FileNameLength >= 0 &&
-                    record.FileNameOffset >= 0 &&
-                    record.FileNameOffset + record.FileNameLength <= record.RecordLength)
+                if (TryReadRecord(recordPointer, record.RecordLength, record.MajorVersion, out UsnChangeRecord change))
                 {
-                    string? name = Marshal.PtrToStringUni(
-                        IntPtr.Add(recordPointer, record.FileNameOffset),
-                        record.FileNameLength / sizeof(char));
-                    if (!string.IsNullOrEmpty(name))
-                    {
-                        onRecord(new UsnChangeRecord(
-                            record.FileReferenceNumber,
-                            record.ParentFileReferenceNumber,
-                            name,
-                            (record.FileAttributes & FileAttributes.Directory) != 0,
-                            record.Reason));
-                        count++;
-                    }
+                    onRecord(change);
+                    count++;
                 }
 
                 recordPointer = IntPtr.Add(recordPointer, record.RecordLength);
@@ -250,6 +236,67 @@ internal sealed class UsnJournalReader : IDisposable
         }
 
         return new UsnJournalReadResult(false, initialState, count);
+    }
+
+    private static bool TryReadRecord(IntPtr pointer, int recordLength, short majorVersion, out UsnChangeRecord change)
+    {
+        change = null!;
+        long frn;
+        long parentFrn;
+        uint reason;
+        FileAttributes attributes;
+        short nameLength;
+        short nameOffset;
+        switch (majorVersion)
+        {
+            case 2:
+                if (recordLength < Marshal.SizeOf<UsnRecordV2>())
+                {
+                    return false;
+                }
+
+                UsnRecordV2 v2 = Marshal.PtrToStructure<UsnRecordV2>(pointer);
+                frn = v2.FileReferenceNumber;
+                parentFrn = v2.ParentFileReferenceNumber;
+                reason = v2.Reason;
+                attributes = v2.FileAttributes;
+                nameLength = v2.FileNameLength;
+                nameOffset = v2.FileNameOffset;
+                break;
+            case 3:
+                // USN_RECORD_V3 stores 128-bit file IDs. NTFS volumes using this service retain
+                // the low 64 bits used by OpenFileById; the layout otherwise matches V2 after IDs.
+                const int V3FileNameLengthOffset = 72;
+                const int V3FileNameOffsetOffset = 74;
+                if (recordLength < 76)
+                {
+                    return false;
+                }
+
+                frn = Marshal.ReadInt64(pointer, 8);
+                parentFrn = Marshal.ReadInt64(pointer, 24);
+                reason = unchecked((uint)Marshal.ReadInt32(pointer, 56));
+                attributes = (FileAttributes)Marshal.ReadInt32(pointer, 68);
+                nameLength = Marshal.ReadInt16(pointer, V3FileNameLengthOffset);
+                nameOffset = Marshal.ReadInt16(pointer, V3FileNameOffsetOffset);
+                break;
+            default:
+                return false;
+        }
+
+        if (nameLength <= 0 || nameOffset < 0 || nameOffset + nameLength > recordLength)
+        {
+            return false;
+        }
+
+        string? name = Marshal.PtrToStringUni(IntPtr.Add(pointer, nameOffset), nameLength / sizeof(char));
+        if (string.IsNullOrEmpty(name))
+        {
+            return false;
+        }
+
+        change = new UsnChangeRecord(frn, parentFrn, name, (attributes & FileAttributes.Directory) != 0, reason);
+        return true;
     }
 
     public void Dispose()

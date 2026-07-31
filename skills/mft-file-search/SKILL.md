@@ -1,6 +1,6 @@
 ---
 name: mft-file-search
-Perform exact and substring local file and directory lookup on Windows NTFS volumes with the bundled MftFileSearch executable. Use for MFT indexing, USN Journal incremental updates, extension counts, and current-path confirmation.
+Perform exact and substring local file and directory lookup on Windows NTFS volumes with the bundled MftFileSearch executable. Use the optional pure-memory MFT service for fast persistent queries, extension counts, and current-path confirmation.
 license: MIT
 compatibility: Windows 10 or later, local NTFS volumes, and an administrator token for scans, updates, and live NTFS path confirmation.
 ---
@@ -15,29 +15,21 @@ Run commands from the skill directory. In PowerShell, use `&` before the executa
 & .\tools\MftFileSearch.exe --help
 ```
 
-By default, the index is stored beside the bundled EXE as `tools\file-index.mftdb`.
+For standalone CLI use, the optional persistent index is stored beside the bundled EXE as `tools\file-index.mftdb`. The pure-memory `serve` mode does not use that file.
 
-## Index lifecycle
+## Pure-memory service lifecycle
 
-### First use or recovery
-
-A missing index, an incompatible `.mftdb` format, a rebuilt USN Journal, or a Journal history gap requires a full scan:
+For a persistent RAM-only query service, start `serve`. It directly scans all ready NTFS MFTs into compact service-process memory and does not read or write `.mftdb`. After the initial scan, it polls each volume's USN Journal about once per second and applies create, delete, move, and rename changes. If Journal history is unavailable, it rescans only the affected volume:
 
 ```powershell
-& .\tools\MftFileSearch.exe scan all
+& .\tools\MftFileSearch.exe serve --pipe <管道名称>
 ```
 
-Use `scan C:` or `scan D:` when only one volume needs rebuilding. A full scan may take time and normally requires an administrator token. Do not perform it merely for a normal search unless no usable index exists or the user explicitly asks to rebuild.
+The service accepts local named-pipe requests from an integration such as the pi extension. It remains usable until it receives `shutdown` or Windows restarts. A service `reload` request performs another full MFT scan and atomically replaces its in-memory index.
 
-### Freshness update
+A full MFT scan can take time and normally requires an administrator token. Normal filesystem changes are synchronized automatically; do not request a rescan for a normal search. Use `reload` only when the user explicitly wants a full refresh.
 
-When the user requests current results or says files have changed, synchronize the existing index first:
-
-```powershell
-& .\tools\MftFileSearch.exe update all
-```
-
-`update` reads only USN Journal changes and does not re-enumerate the whole MFT. If it reports that a full scan is required, report that condition and use `scan` only when appropriate.
+The standalone `scan` and `update` CLI commands remain available for the optional persistent `.mftdb` workflow, but do not apply to a pure-memory service.
 
 ## Queries
 
@@ -59,7 +51,7 @@ When the user knows only part of a file name, use `search-part`:
 & .\tools\MftFileSearch.exe search-part <文件名片段>
 ```
 
-This is a case-insensitive contains match for English names. It is not wildcard or regular-expression search. Results are paginated: the default page is 100 paths, and the command emits `NEXT_OFFSET=<number>` on standard error when another page exists. Repeat the same query with `--offset <number>` and the same `--limit` to continue. For Agent calls, request a small page first and continue only when needed. This command requires a `.mftdb v5` index, so an older index must be rebuilt with `scan` first.
+This is a case-insensitive contains match for English names. It is not wildcard or regular-expression search. The standalone CLI emits `NEXT_OFFSET=<number>` on standard error when another page exists. The named-pipe service additionally returns an opaque `nextCursor`; send it back with the same command and query to continue without rebuilding the match candidate list. In-memory fragment queries of three or more characters use a trigram inverted index; one- and two-character fragments fall back to a full in-memory scan. For Agent calls, request a small page first and continue only when needed.
 
 ### Exact folder-name search
 
@@ -110,7 +102,7 @@ Without `--db`, the index lives next to the executable. Use the same explicit in
 
 - Return every path emitted by `search` or `search-dir`.
 - If an exact or substring search emits no path and exits with `0`, report that no indexed match was found.
-- For a multi-page result, return the current page first. Continue only when needed, using the returned `NEXT_OFFSET` with the same query and page size.
+- For a multi-page service result, return the current page first. Continue only when needed, using `nextOffset` and `nextCursor` with the same query and page size. Service cursors expire after ten minutes or after a service reload.
 - Do not use an arbitrarily large page size; a smaller page keeps Agent context focused.
 - Do not infer file locations from an extension count.
 - Preserve UTF-8 output; Windows paths can contain Chinese and other Unicode characters.

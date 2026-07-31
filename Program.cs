@@ -10,9 +10,13 @@ internal static class Program
 
     private static int Main(string[] args)
     {
-        // 索引名称以 UTF-8 写入；统一控制台编码，保证中文路径在 CMD/PowerShell 中正确显示。
-        Console.InputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-        Console.OutputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        // 后台 serve 进程由 Windows 以 detached 方式启动时没有控制台句柄；不要初始化 Console 编码。
+        // 其他 CLI 命令统一使用 UTF-8，保证中文路径在 CMD/PowerShell 中正确显示。
+        if (!IsServeMode(args))
+        {
+            Console.InputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+            Console.OutputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        }
 
         try
         {
@@ -23,6 +27,22 @@ internal static class Program
             Console.Error.WriteLine($"错误：{exception.Message}");
             return OperationFailed;
         }
+    }
+
+    private static bool IsServeMode(string[] args)
+    {
+        for (int index = 0; index < args.Length; index++)
+        {
+            if (string.Equals(args[index], "--db", StringComparison.OrdinalIgnoreCase))
+            {
+                index++;
+                continue;
+            }
+
+            return string.Equals(args[index], "serve", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
     }
 
     private static int Run(string[] args)
@@ -45,8 +65,8 @@ internal static class Program
         string[] commandArguments = args[(consumedOptions + 1)..];
         var database = new FileIndexDatabase(databasePath);
 
-        // A full scan replaces index data and must be able to upgrade an incompatible prior format.
-        if (command != "scan")
+        // scan 使用/覆盖磁盘索引；serve 则构建纯内存索引，两者都不应先读取 .mftdb。
+        if (command is not "scan" and not "serve")
         {
             database.Initialize();
         }
@@ -61,6 +81,7 @@ internal static class Program
             "search-dir" => SearchDirectory(database, commandArguments),
             "search-dir-part" => SearchDirectoryPart(database, commandArguments),
             "volumes" => PrintVolumes(database, commandArguments),
+            "serve" => Serve(database, commandArguments),
             "help" or "--help" or "-h" or "/?" => PrintHelpAndReturnSuccess(),
             _ => UnknownCommand(command)
         };
@@ -338,6 +359,17 @@ internal static class Program
         }
     }
 
+    private static int Serve(FileIndexDatabase database, string[] args)
+    {
+        if (args.Length != 2 || !string.Equals(args[0], "--pipe", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(args[1]))
+        {
+            Console.Error.WriteLine("用法：MftFileSearch [--db <索引文件>] serve --pipe <管道名称>");
+            return InvalidArguments;
+        }
+
+        return new MftQueryServer(args[1], database).Run();
+    }
+
     private static int PrintVolumes(FileIndexDatabase database, string[] args)
     {
         if (args.Length != 0)
@@ -415,6 +447,10 @@ internal static class Program
               volumes
                   输出已索引卷的卷名、文件数和 UTC 索引时间，字段以制表符分隔。
 
+              serve --pipe <管道名称>
+                  直接扫描所有已就绪 NTFS 卷的 MFT，并将索引仅常驻在本地命名管道服务内存中。
+                  不读写 .mftdb；供兼容插件复用，一般无需手动运行。
+
             示例：
               MftFileSearch scan <驱动器|all>
               MftFileSearch update <驱动器|all>
@@ -423,6 +459,7 @@ internal static class Program
               MftFileSearch search-dir <完整文件夹名> --limit <数量> --offset <偏移量>
               MftFileSearch search-dir-part <文件夹名片段> --limit <数量> --offset <偏移量>
               MftFileSearch count <扩展名>
+              MftFileSearch serve --pipe <管道名称>
               MftFileSearch --db <索引文件> update <驱动器|all>
 
             退出码：
