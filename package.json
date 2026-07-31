@@ -1,8 +1,8 @@
 {
   "name": "mft-file-search",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "private": true,
-  "description": "Millisecond-level Windows NTFS file search using MFT and USN Journal, with a universal Agent Skill.",
+  "description": "Pure-memory Windows NTFS file search with live updates and Agent Skills support.",
   "keywords": [
     "windows-file-search",
     "millisecond-search",

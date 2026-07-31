@@ -37,6 +37,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path release-skill\mft-file-search\tools
           Copy-Item skills\mft-file-search\SKILL.md release-skill\mft-file-search\SKILL.md
+          Copy-Item skills\mft-file-search\SKILL.en.md release-skill\mft-file-search\SKILL.en.md
           Copy-Item publish-aot\MftFileSearch.exe release-skill\mft-file-search\tools\MftFileSearch.exe
           Compress-Archive -Path release-skill\mft-file-search -DestinationPath mft-file-search-skill-win-x64.zip
 
